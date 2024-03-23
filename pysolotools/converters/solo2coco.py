@@ -2,16 +2,21 @@ import argparse
 import json
 import logging
 import multiprocessing
+
 import os
 import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple, Union
+
+from tqdm import tqdm
 
 import cv2
 import numpy as np
 from pycocotools.mask import encode as mask_to_rle
+
+
 
 from pysolotools.constants import COCO_KEYPOINTS
 from pysolotools.consumers import Solo
@@ -49,10 +54,10 @@ class SOLO2COCOConverter:
             ├── file_name.json
         └── images
     """
-
+    ALL_KEYPOINTS_IN_SOLO:int=-1
     def __init__(self, solo: Solo):
         self._solo = solo
-        self._pool = multiprocessing.Pool(processes=multiprocessing.cpu_count())
+        self._pool = multiprocessing.Pool(processes=4)
         self._bbox_annotations = []
         self._instance_annotations = []
         self._semantic_annotations = []
@@ -62,7 +67,7 @@ class SOLO2COCOConverter:
         return "pysolo_extensions.converters.solo2coco"
 
     @staticmethod
-    def _process_rgb_image(image_id, rgb_capture, output, data_root, sequence_num):
+    def _process_rgb_image(image_id, rgb_capture, output, data_root, sequence_num,copy_images,ln_instead_of_cp):
         """
         Args:
             image_id (int): Image ID
@@ -84,7 +89,16 @@ class SOLO2COCOConverter:
 
         image_to_file = f"camera_{image_id}.png"
         image_to = image_to_folder / image_to_file
-        shutil.copy(str(image_file), str(image_to))
+        
+        if copy_images:
+            if not image_to.exists():
+                if ln_instead_of_cp:
+                    os.symlink(image_file, str(image_to))
+                else:
+                    shutil.copy(str(image_file), str(image_to))
+            else:
+                logger.info(f"Image {image_to_file} already exists.")
+            
 
         record = {
             "id": image_id,
@@ -150,7 +164,7 @@ class SOLO2COCOConverter:
         return filtered_ann
 
     @staticmethod
-    def _keypoints_map(solo_kp_map: Dict, kp_ann: KeypointAnnotation):
+    def _keypoints_map(solo_kp_map: Dict, kp_ann: KeypointAnnotation,keypoints_labels:Optional[Union[List[str],int]]=None):
         """
         Args:
             solo_kp_map (Dict): SOLO keypoint dictionary that maps index to labels
@@ -160,16 +174,23 @@ class SOLO2COCOConverter:
             kp_map: Dict containing mapping of instance id to COCO format keypoints value and num keypoints tuple.
         """
         keypoint_map = {}
+        if keypoints_labels is None:
+            keypoints_labels = COCO_KEYPOINTS
+        elif keypoints_labels==SOLO2COCOConverter.ALL_KEYPOINTS_IN_SOLO:
+            keypoints_labels = [solo_kp_map[i] for i in solo_kp_map.keys()]
+        if not isinstance(kp_ann,KeypointAnnotation):
+            raise ValueError("kp_ann should be of type KeypointAnnotation")
+
         for ann_kpt in kp_ann.values:
             keypoints_vals, num_keypoints = [], 0
-            for k in COCO_KEYPOINTS:
+            for k in keypoints_labels:
                 for kpt in ann_kpt.keypoints:
                     label = solo_kp_map[kpt.index]
                     if label == k:
                         keypoints_vals.extend(
                             [
-                                int(np.floor(kpt.location[0])),
-                                int(np.floor(kpt.location[1])),
+                                float(kpt.location[0]),
+                                float(kpt.location[1]),
                                 kpt.state,
                             ]
                         )
@@ -199,7 +220,7 @@ class SOLO2COCOConverter:
 
     @staticmethod
     def _process_annotations(
-        image_id, rgb_capture, sequence_num, data_root, solo_kp_map
+        image_id, rgb_capture, sequence_num, data_root, solo_kp_map,keypoints_labels
     ):
         bbox_annotations = []
         instance_annotations = []
@@ -207,7 +228,9 @@ class SOLO2COCOConverter:
 
         bbox_ann = SOLO2COCOConverter._filter_annotation(
             ann_type=BoundingBox2DAnnotation, annotations=rgb_capture.annotations
-        ).values
+        )
+        if bbox_ann:
+            bbox_ann =bbox_ann.values
 
         ins_seg = SOLO2COCOConverter._filter_annotation(
             ann_type=InstanceSegmentationAnnotation, annotations=rgb_capture.annotations
@@ -221,7 +244,7 @@ class SOLO2COCOConverter:
             ann_type=KeypointAnnotation, annotations=rgb_capture.annotations
         )
         if kp_ann:
-            keypoint_map = SOLO2COCOConverter._keypoints_map(solo_kp_map, kp_ann)
+            keypoint_map = SOLO2COCOConverter._keypoints_map(solo_kp_map, kp_ann,keypoints_labels)
         else:
             keypoint_map = {}
 
@@ -233,10 +256,10 @@ class SOLO2COCOConverter:
 
             for bbox in bbox_ann:
                 x, y, w, h = [
-                    int(bbox.origin[0]),
-                    int(bbox.origin[1]),
-                    int(bbox.dimension[0]),
-                    int(bbox.dimension[1]),
+                    float(bbox.origin[0]),
+                    float(bbox.origin[1]),
+                    float(bbox.dimension[0]),
+                    float(bbox.dimension[1]),
                 ]
                 segmentation = []
                 if bbox.labelName in class_color_map:
@@ -274,10 +297,10 @@ class SOLO2COCOConverter:
             for bbox, ins in zip(bbox_ann, ins_seg_instances):
 
                 x, y, w, h = [
-                    int(bbox.origin[0]),
-                    int(bbox.origin[1]),
-                    int(bbox.dimension[0]),
-                    int(bbox.dimension[1]),
+                    float(bbox.origin[0]),
+                    float(bbox.origin[1]),
+                    float(bbox.dimension[0]),
+                    float(bbox.dimension[1]),
                 ]
                 segmentation = SOLO2COCOConverter._compute_segmentation_map(
                     ins_image=ins_seg_img.copy(), color=ins.color
@@ -303,10 +326,10 @@ class SOLO2COCOConverter:
 
             for bbox in bbox_ann:
                 x, y, w, h = [
-                    int(bbox.origin[0]),
-                    int(bbox.origin[1]),
-                    int(bbox.dimension[0]),
-                    int(bbox.dimension[1]),
+                    float(bbox.origin[0]),
+                    float(bbox.origin[1]),
+                    float(bbox.dimension[0]),
+                    float(bbox.dimension[1]),
                 ]
                 keypoints_vals, num_keypoints = [], 0
                 if kp_ann and bbox.instanceId in keypoint_map:
@@ -391,7 +414,7 @@ class SOLO2COCOConverter:
 
     @staticmethod
     def _process_instances(
-        frame: Frame, idx, output, data_root, solo_kp_map
+        frame: Frame, idx, output, data_root, solo_kp_map,copy_images,ln_instead_of_cp,keypoints_labels
     ) -> Tuple[Dict, List, List, List]:
         logger.info(f"Processing Frame number: {idx}")
         image_id = idx
@@ -401,14 +424,14 @@ class SOLO2COCOConverter:
         )[0]
 
         img_record = SOLO2COCOConverter._process_rgb_image(
-            image_id, rgb_capture, output, data_root, sequence_num
+            image_id, rgb_capture, output, data_root, sequence_num,copy_images,ln_instead_of_cp
         )
         (
             ann_record,
             ins_ann_record,
             sem_ann_record,
         ) = SOLO2COCOConverter._process_annotations(
-            image_id, rgb_capture, sequence_num, data_root, solo_kp_map
+            image_id, rgb_capture, sequence_num, data_root, solo_kp_map,keypoints_labels
         )
 
         return img_record, ann_record, ins_ann_record, sem_ann_record
@@ -434,18 +457,32 @@ class SOLO2COCOConverter:
         self._bbox_annotations += result[1]
         self._instance_annotations += result[2]
         self._semantic_annotations += result[3]
+    def error_callback(this,e):
+        print(f"Error: {e}")
+        raise Exception(e)
 
-    def convert(self, output_path: str, dataset_name: str = "coco"):
+    def convert(self, output_path: str, dataset_name: str = "coco",copy_images:bool=True,ln_instead_of_cp:bool=False,keypoints_labels:Optional[Union[List[str],int]]=None):
+        """_summary_
+
+        Args:
+            output_path (str): _description_
+            dataset_name (str, optional): _description_. Defaults to "coco".
+            copy_images (bool, optional): _description_. Defaults to True.
+            ln_instead_of_cp (bool, optional): _description_. Defaults to False.
+            keypoints_labels (Optional[List[str]], optional): which keypoints to include, if empty, using COCO Keypoints labels. Defaults to None.
+        """        
         output = os.path.join(output_path, dataset_name)
 
         solo_kp_map = self._get_solo_kp_map()
 
-        for idx, frame in enumerate(self._solo.frames()):
+        for idx, frame in tqdm(enumerate(self._solo.frames()),total=self._solo.end or self._solo.metadata.totalFrames):
             self._pool.apply_async(
                 self._process_instances,
-                args=(frame, idx, output, self._solo.data_path, solo_kp_map),
+                args=(frame, idx, output, self._solo.data_path, solo_kp_map,copy_images,ln_instead_of_cp,keypoints_labels),
                 callback=self.callback,
+                error_callback=self.error_callback
             )
+            
         self._pool.close()
         self._pool.join()
 

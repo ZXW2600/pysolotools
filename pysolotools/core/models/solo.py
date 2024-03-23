@@ -36,8 +36,10 @@ class Capture:
         self.annotations = [
             DataFactory.cast_annotation(anno)
             for anno in self.annotations
+            if "values" in anno.keys()
             if DataFactory.cast_annotation(anno)
         ]
+        # print(self.annotations)
 
     def __eq__(self, other):
         if other == self.id:
